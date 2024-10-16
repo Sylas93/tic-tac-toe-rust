@@ -18,6 +18,7 @@
 //! messages.
 
 use std::{
+    time::Duration,
     ptr,
     collections::HashMap,
     env,
@@ -172,11 +173,30 @@ async fn main() -> Result<(), IoError> {
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
     let game_sessions = PeerList::new(Mutex::new(Vec::with_capacity(6)));
-
+    let rc_game_sessions = Arc::clone(&game_sessions);
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&addr).await;
     let listener = try_socket.expect("Failed to bind");
     println!("Listening on: {}", addr);
+
+    // clean closed games
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(5000));
+        loop {
+            interval.tick().await;
+            println!("tick");
+            let mut indexes = Vec::new();
+            let mut sessions = rc_game_sessions.lock().unwrap();
+            for (index, el) in sessions.iter().enumerate() {
+                if el.phase == GameSessionPhase::CLOSED {
+                    indexes.push(index);
+                }
+            }
+            for i in indexes {
+                sessions.remove(i);
+            }
+        }
+    });
 
     // Let's spawn the handling of each connection in a separate task.
     while let Ok((stream, addr)) = listener.accept().await {
