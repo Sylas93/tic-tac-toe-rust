@@ -17,6 +17,10 @@
 //! connected clients they'll all join the same room and see everyone else's
 //! messages.
 
+mod board;
+
+use board::{CellOwner, GameBoard};
+
 use std::{
     time::Duration,
     ptr,
@@ -36,22 +40,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 type PeerList = Arc<Mutex<Vec<GameSession>>>;
 
-enum CellOwner {
-    NONE,
-    PlayerA,
-    PlayerB
-}
-
-impl CellOwner {
-    fn opponent(&self) -> CellOwner  {
-        match self {
-            CellOwner::PlayerA => CellOwner::PlayerB,
-            CellOwner::PlayerB => CellOwner::PlayerA,
-            _ => CellOwner::NONE
-        }
-    }
-}
-
 #[derive(PartialEq)]
 enum GameSessionPhase {
     LOBBY,
@@ -59,10 +47,10 @@ enum GameSessionPhase {
     CLOSED
 }
 
-
 struct GameSession {
+    board: GameBoard,
     phase: GameSessionPhase,
-    turn: CellOwner,
+    turn: &'static str,
     sender_a: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>,
     sender_b: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>
 }
@@ -70,6 +58,7 @@ struct GameSession {
 impl GameSession {
     fn new() -> GameSession {
         GameSession {
+            board: GameBoard::new(),
             phase: GameSessionPhase::LOBBY, turn: CellOwner::NONE, sender_a: None, sender_b: None
         }
     }
@@ -83,8 +72,6 @@ fn build_info_message(s: &str) -> Message {
 }
 
 async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: PeerList) {
-    println!("Incoming TCP connection from: {}", addr);
-
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
         .await
         .expect("Error during the websocket handshake occurred");
@@ -114,7 +101,7 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: P
                     None => panic!("sender_a is None")
                 };
                 println!("Session size: {}", x.len());
-                (rx.map(Ok).forward(outgoing), CellOwner::PlayerB)
+                (rx.map(Ok).forward(outgoing), CellOwner::PLAYER_B)
 
             },
             None => {
@@ -124,7 +111,7 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: P
                 new_session.sender_a = Some((Arc::clone(&tx), addr));
                 x.push(new_session);
                 println!("Session size: {}", x.len());
-                (rx.map(Ok).forward(outgoing), CellOwner::PlayerA)
+                (rx.map(Ok).forward(outgoing), CellOwner::PLAYER_A)
             }
         };
         let (opponent_messages, player) = result;
@@ -132,7 +119,7 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: P
             println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
             // echo server
             let mut echo_message = String::from("I got your message ");
-            echo_message.push_str(match player { CellOwner::PlayerA => "Player A", CellOwner::PlayerB => "Player B", _ => "ERROR" });
+            echo_message.push_str(player);
             &tx.unbounded_send(build_info_message(&echo_message)).unwrap();
             future::ok(())
         });
@@ -165,7 +152,6 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: P
         },
         _ => println!("Not cleaned")
     }
-    //peer_map.lock().unwrap().remove(&addr);
 }
 
 #[tokio::main]
