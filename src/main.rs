@@ -11,18 +11,11 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use std::cell::RefCell;
-use std::ops::Deref;
-use std::rc::Rc;
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
-use futures_util::future::Ready;
-use futures_util::stream::{SplitStream, TryForEach};
 use futures_util::task::SpawnExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::WebSocketStream;
 
 type PeerList = Arc<Mutex<Vec<GameSession>>>;
 
@@ -123,7 +116,7 @@ async fn handle_connection(
 
             for (i, s) in sessions.iter_mut().enumerate() {
                 session_index = i;
-                if (s.phase == GameSessionPhase::LOBBY) {
+                if s.phase == GameSessionPhase::LOBBY {
                     &tx.unbounded_send(
                         message(&GameMessageFactory::build_plain_message("You just joined an existing game!", MessageType::INFO))
                     ).unwrap();
@@ -135,7 +128,7 @@ async fn handle_connection(
                 }
             }
 
-            if (is_player_a) {
+            if is_player_a {
                 if sessions.len() > 0 { session_index += 1; }
                 let mut s = GameSession::new();
                 &tx.unbounded_send(
@@ -147,7 +140,7 @@ async fn handle_connection(
 
             }
         }
-        let player =  if (is_player_a) {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
+        let player =  if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
 
 
         let feedback = incoming
@@ -196,7 +189,7 @@ async fn handle_connection(
     ).take(1).next();
     match res {
         Some(el) => {
-            println!("Disconneted matched");
+            println!("Disconnected matched");
             el.phase = GameSessionPhase::CLOSED;
         },
         _ => println!("Not cleaned")
