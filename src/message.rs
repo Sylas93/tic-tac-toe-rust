@@ -48,18 +48,14 @@ impl GameMessageFactory {
         }
     }
 
-    pub fn get_default(&self, index: usize) -> Message {
-        Message::Text(self.defaults.get(&index).unwrap().clone())
+    pub fn get_default(&self, index: usize) -> &String {
+        match self.defaults.get(&index) {
+            Some(value) => value,
+            None => panic!("No default value found for index {}", index)
+        }
     }
 
-    pub fn build_message(&self, m: &str, t: &str) -> Message {
-        let template = "{ \"text\": \"$\", \"type\": \"$\" }";
-        let message = String::from(template).replacen("$", m, 1).replacen("$", t, 1);
-        println!("The resulting message is: {message}");
-        Message::Text(message)
-    }
-
-    pub fn parse_input(&self, input: Message) -> (String, String) {
+    pub fn parse_input(&self, input: &Message) -> (String, String) {
         let input_text = input.to_text().unwrap();
         println!("Received a message: {}", input_text);
         let v: Value = serde_json::from_str(input_text).unwrap();
@@ -74,7 +70,7 @@ impl GameMessageFactory {
         (input_text, input_type)
     }
 
-    fn build_plain_message(m: &str, t: &str) -> String {
+    pub fn build_plain_message(m: &str, t: &str) -> String {
         let template = "{ \"text\": \"$\", \"type\": \"$\" }";
         let message = String::from(template).replacen("$", m, 1).replacen("$", t, 1);
         println!("The resulting message is: {message}");

@@ -1,22 +1,3 @@
-//! A chat server that broadcasts a message to all connections.
-//!
-//! This is a simple line-based server which accepts WebSocket connections,
-//! reads lines from those connections, and broadcasts the lines to all other
-//! connected clients.
-//!
-//! You can test this out by running:
-//!
-//!     cargo run --example server 127.0.0.1:12345
-//!
-//! And then in another window run:
-//!
-//!     cargo run --example client ws://127.0.0.1:12345/
-//!
-//! You can run the second command in multiple windows and then chat between the
-//! two, seeing the messages from the other client as they're received. For all
-//! connected clients they'll all join the same room and see everyone else's
-//! messages.
-
 mod board;
 mod message;
 
@@ -30,12 +11,18 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+use std::cell::RefCell;
 use std::ops::Deref;
+use std::rc::Rc;
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
+use futures_util::future::Ready;
+use futures_util::stream::{SplitStream, TryForEach};
 use futures_util::task::SpawnExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::WebSocketStream;
 
 type PeerList = Arc<Mutex<Vec<GameSession>>>;
 
@@ -46,19 +33,29 @@ enum GameSessionPhase {
     CLOSED
 }
 
+fn message(plain: &str) -> Message {
+    Message::Text(String::from(plain))
+}
+
+fn multi_message_send(sender: &UnboundedSender<Message>, messages: &[&String]) {
+    for &plain_message in messages {
+        sender.unbounded_send(message(plain_message)).expect("Failed to send message");
+    }
+}
+
 struct GameSession {
     board: GameBoard,
     phase: GameSessionPhase,
     turn: &'static str,
     sender_a: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>,
-    sender_b: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>
+    sender_b: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>,
 }
 
 impl GameSession {
     fn new() -> GameSession {
         GameSession {
             board: GameBoard::new(),
-            phase: GameSessionPhase::LOBBY, turn: CellOwner::NONE, sender_a: None, sender_b: None
+            phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a: None, sender_b: None
         }
     }
 
@@ -67,7 +64,7 @@ impl GameSession {
         match &self.sender_a {
             Some(sender) => {
                 sender.0.unbounded_send(
-                    game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE)
+                    message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
                 ).unwrap();
             },
             None => {println!("Non va start game A")}
@@ -75,7 +72,7 @@ impl GameSession {
         match &self.sender_b {
             Some(sender) => {
                 sender.0.unbounded_send(
-                    game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE)
+                    message(game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE))
                 ).unwrap();
             },
             None => {println!("Non va start game B")}
@@ -89,63 +86,93 @@ impl GameSession {
             message_type == MessageType::CLIENT_CLICK &&
             self.board.update_cell(message_text.parse().unwrap(), player)
     }
+
+    fn opponent_sink(&self, player: &str) -> Arc<UnboundedSender<Message>> {
+        if player == CellOwner::PLAYER_A {
+            self.sender_b.as_ref().unwrap().0.clone()
+        } else {
+            self.sender_a.as_ref().unwrap().0.clone()
+        }
+    }
 }
 
-async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: PeerList) {
-    let game_message_factory = GameMessageFactory::new();
+async fn handle_connection(
+    raw_stream: TcpStream,
+    addr: SocketAddr,
+    peer_list: PeerList,
+    game_message_factory: GameMessageFactory,
+    mut session_index: usize
+) {
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
         .await
         .expect("Error during the websocket handshake occurred");
     println!("WebSocket connection established: {}", addr);
+    let active = Arc::new(Mutex::new(true));
+    let active1 = Arc::clone(&active);
 
     let (outgoing, incoming) = ws_stream.split();
     let (tx, rx) = unbounded();
     let tx = Arc::new(tx);
 
     let result = async {
-        let mut x = peer_list.lock().unwrap();
-        let lobby_session = x
-            .iter_mut()
-            .filter(|s| s.phase == GameSessionPhase::LOBBY)
-            .take(1).next();
-        let result = match lobby_session {
-            Some(lobby_session) => {
-                println!("Found session");
-                &tx.unbounded_send(
-                    game_message_factory.build_message("You just joined an existing game!", MessageType::INFO)
-                ).unwrap();
-                lobby_session.sender_b = Some((Arc::clone(&tx), addr));
-                lobby_session.start_game(&game_message_factory);
 
-                println!("Session size: {}", x.len());
-                (rx.map(Ok).forward(outgoing), CellOwner::PLAYER_B)
-            },
-            None => {
-                println!("Creating session");
-                let mut new_session = GameSession::new();
-                &tx.unbounded_send(
-                    game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE)
-                ).unwrap();
-                new_session.sender_a = Some((Arc::clone(&tx), addr));
-                x.push(new_session);
-                println!("Session size: {}", x.len());
-                (rx.map(Ok).forward(outgoing), CellOwner::PLAYER_A)
+        let mut is_player_a = true;
+
+        {
+            let mut sessions = peer_list.lock().unwrap();
+
+            for (i, s) in sessions.iter_mut().enumerate() {
+                session_index = i;
+                if (s.phase == GameSessionPhase::LOBBY) {
+                    &tx.unbounded_send(
+                        message(&GameMessageFactory::build_plain_message("You just joined an existing game!", MessageType::INFO))
+                    ).unwrap();
+                    s.sender_b = Some((Arc::clone(&tx), addr));
+                    s.start_game(&game_message_factory);
+                    is_player_a = false;
+
+                    break;
+                }
             }
-        };
-        let (opponent_messages, player) = result;
-        let input_messages = incoming.try_for_each(move |msg| {
-            let (input_text, input_type) = game_message_factory.parse_input(msg);
 
-            // echo server
-            let mut echo_message = String::from("I got your message: ");
-            echo_message.push_str(&*input_text);
-            echo_message.push_str(player);
-            &tx.unbounded_send(
-                game_message_factory.build_message(&echo_message, MessageType::INFO)
-            ).unwrap();
-            future::ok(())
-        });
-        future::select(opponent_messages, input_messages)
+            if (is_player_a) {
+                if sessions.len() > 0 { session_index += 1; }
+                let mut s = GameSession::new();
+                &tx.unbounded_send(
+                    message(game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE))
+                ).unwrap();
+                s.sender_a = Some((Arc::clone(&tx), addr));
+                sessions.push(s);
+
+
+            }
+        }
+        let player =  if (is_player_a) {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
+
+
+        let feedback = incoming
+            .try_take_while(|_| { future::ok(
+                *active.lock().unwrap()
+            )})
+            .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
+            //.try_take_while(|(_, input_type)| {future::ok(input_type != MessageType::END)})
+            .try_for_each(|input| {
+                player_feedback(player, input, &game_message_factory, &mut peer_list.lock().unwrap()[session_index]);
+                future::ok(())
+            });
+
+        let opponent_messages = rx
+            .map(|x| {
+                if game_message_factory.parse_input(&x).1 == MessageType::END {
+                    *active1.lock().unwrap() = false;
+                }
+                x
+            })
+            //.peekable()
+            //.peek()
+            //.take_while(async {|msg| {future::ready(game_message_factory.parse_input(msg).1 == MessageType::END)}})
+            .map(Ok).forward(outgoing);
+        future::select(opponent_messages, feedback)
     }.await;
 
     pin_mut!(result);
@@ -176,6 +203,57 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, peer_list: P
     }
 }
 
+fn player_feedback(
+    player: &'static str,
+    (input_text, input_type): (String, String),
+    game_message_factory: &GameMessageFactory,
+    lobby_session: &mut GameSession
+) {
+    if lobby_session.update_board(player, &input_text, &input_type) {
+        println!("Board updated!");
+        let figure_message = if player == CellOwner::PLAYER_A {
+            game_message_factory.get_default(GameMessageFactory::X_FIGURE_MESSAGE)
+        } else {
+            game_message_factory.get_default(GameMessageFactory::O_FIGURE_MESSAGE)
+        };
+        let show_message = &GameMessageFactory::build_plain_message(&input_text, MessageType::SHOW);
+        let winner = lobby_session.board.check_winner();
+        if winner == CellOwner::NONE {
+            lobby_session.turn = CellOwner::opponent(lobby_session.turn);
+            multi_message_send(
+                &*lobby_session.opponent_sink(player),
+                &[figure_message, show_message,
+                    game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE)]
+            );
+            multi_message_send(
+                &*lobby_session.opponent_sink(CellOwner::opponent(player)),
+                &[figure_message, show_message,
+                    game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE)]
+            );
+        } else if winner == player {
+            lobby_session.phase = GameSessionPhase::CLOSED;
+            multi_message_send(
+                &*lobby_session.opponent_sink(player),
+                &[figure_message, show_message,
+                    game_message_factory.get_default(GameMessageFactory::LOST_MESSAGE)]
+            );
+            multi_message_send(
+                &*lobby_session.opponent_sink(CellOwner::opponent(player)),
+                &[figure_message, show_message,
+                    game_message_factory.get_default(GameMessageFactory::WIN_MESSAGE)]
+            );
+        } else if winner == CellOwner::TIE {
+            lobby_session.phase = GameSessionPhase::CLOSED;
+            let tie_messages = &[figure_message, show_message,
+                game_message_factory.get_default(GameMessageFactory::TIE_MESSAGE)];
+            multi_message_send(
+                &*lobby_session.opponent_sink(player), tie_messages);
+            multi_message_send(
+                &*lobby_session.opponent_sink(CellOwner::opponent(player)), tie_messages);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
@@ -195,6 +273,7 @@ async fn main() -> Result<(), IoError> {
             println!("tick");
             let mut indexes = Vec::new();
             let mut sessions = rc_game_sessions.lock().unwrap();
+            println!("Before closed cleanup: {}", sessions.len());
             for (index, el) in sessions.iter().enumerate() {
                 if el.phase == GameSessionPhase::CLOSED {
                     indexes.push(index);
@@ -203,12 +282,13 @@ async fn main() -> Result<(), IoError> {
             for i in indexes {
                 sessions.remove(i);
             }
+            println!("After closed cleanup: {}", sessions.len());
         }
     });
 
     // Let's spawn the handling of each connection in a separate task.
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, addr, game_sessions.clone()));
+        tokio::spawn(handle_connection(stream, addr, game_sessions.clone(), GameMessageFactory::new(), 0));
     }
 
     Ok(())
