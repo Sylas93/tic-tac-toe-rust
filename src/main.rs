@@ -40,12 +40,12 @@ struct GameSession {
     board: GameBoard,
     phase: GameSessionPhase,
     turn: &'static str,
-    sender_a: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>,
+    sender_a: (Arc<UnboundedSender<Message>>, SocketAddr),
     sender_b: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>,
 }
 
 impl GameSession {
-    fn new(sender_a: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>) -> GameSession {
+    fn new(sender_a: (Arc<UnboundedSender<Message>>, SocketAddr)) -> GameSession {
         GameSession {
             board: GameBoard::new(),
             phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a, sender_b: None
@@ -55,14 +55,9 @@ impl GameSession {
     fn start_game(&mut self, game_message_factory: &GameMessageFactory) {
         println!("Starting game");
         self.phase = GameSessionPhase::PLAYING;
-        match &self.sender_a {
-            Some(sender) => {
-                sender.0.unbounded_send(
-                    message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
-                ).unwrap();
-            },
-            None => {println!("Non va start game A")}
-        }
+        self.sender_a.0.unbounded_send(
+            message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
+        ).unwrap();
         match &self.sender_b {
             Some(sender) => {
                 sender.0.unbounded_send(
@@ -71,7 +66,6 @@ impl GameSession {
             },
             None => {println!("Non va start game B")}
         }
-
     }
 
     fn update_board(&mut self, player: &'static str, message_text: &String, message_type: &String) -> bool {
@@ -85,7 +79,7 @@ impl GameSession {
         if player == CellOwner::PLAYER_A {
             self.sender_b.as_ref().unwrap().0.clone()
         } else {
-            self.sender_a.as_ref().unwrap().0.clone()
+            self.sender_a.0.clone()
         }
     }
 }
@@ -108,8 +102,7 @@ async fn handle_connection(
     let tx = Arc::new(tx);
     let mut is_player_a = true;
     let gs = {
-        let x = Arc::clone(&peer_list);
-        let mut x = x.lock().unwrap();
+        let mut x = peer_list.lock().unwrap();
         match x.iter()
         .find(|s| {s.lock().unwrap().phase == GameSessionPhase::LOBBY}) {
             Some(&ref el) => {
@@ -122,7 +115,7 @@ async fn handle_connection(
             },
             None => {
                 println!("New session required");
-                let out = Arc::new(Mutex::new(GameSession::new(Some((Arc::clone(&tx), addr)))));
+                let out = Arc::new(Mutex::new(GameSession::new((Arc::clone(&tx), addr))));
                 x.push(Arc::clone(&out));
                 println!("Deadlock");
                 &tx.unbounded_send(
@@ -171,7 +164,7 @@ async fn handle_connection(
 
     let mut x = peer_list.lock().unwrap();
     let res = x.iter_mut().filter(|s| {
-       let stored_addr = s.lock().unwrap().sender_a.as_ref().unwrap().1; //player A always exist
+       let stored_addr = s.lock().unwrap().sender_a.1; //player A always exist
        println!("stored addr a is {}, against current addr {}", stored_addr, addr);
         stored_addr == addr || {
                 match s.lock().unwrap().sender_b.as_ref() { Some(el) => {
