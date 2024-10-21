@@ -11,6 +11,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+use std::task::Poll;
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
 use futures_util::task::SpawnExt;
@@ -95,15 +96,14 @@ async fn handle_connection(
         .expect("Error during the websocket handshake occurred");
     println!("WebSocket connection established: {}", addr);
     let active = Arc::new(Mutex::new(true));
-    let active1 = Arc::clone(&active);
 
     let (outgoing, incoming) = ws_stream.split();
     let (tx, rx) = unbounded();
     let tx = Arc::new(tx);
     let mut is_player_a = true;
     let gs = {
-        let mut x = peer_list.lock().unwrap();
-        match x.iter()
+        let mut sessions = peer_list.lock().unwrap();
+        match sessions.iter()
         .find(|s| {s.lock().unwrap().phase == GameSessionPhase::LOBBY}) {
             Some(&ref el) => {
                 println!("Existing session found");
@@ -116,49 +116,47 @@ async fn handle_connection(
             None => {
                 println!("New session required");
                 let out = Arc::new(Mutex::new(GameSession::new((Arc::clone(&tx), addr))));
-                x.push(Arc::clone(&out));
-                println!("Deadlock");
+                sessions.push(Arc::clone(&out));
                 &tx.unbounded_send(
                     message(game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE))
                 ).unwrap();
-                println!("Completed None");
                 out
             }
         }
     };
 
-    let result = async {
+    let combined_input_output = {
 
         let player =  if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
 
-        let feedback = incoming
-            .try_take_while(|_| { future::ok(
-                *active.lock().unwrap()
-            )})
+        let input_processing = incoming
             .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
-            //.try_take_while(|(_, input_type)| {future::ok(input_type != MessageType::END)})
             .try_for_each(|input| {
                 player_feedback(player, input, &game_message_factory, Arc::clone(&gs));
                 future::ok(())
             });
 
         let opponent_messages = rx
-            .map(|x| {
-                if game_message_factory.parse_input(&x).1 == MessageType::END {
-                    *active1.lock().unwrap() = false;
+            .map(|msg| {
+                if game_message_factory.parse_input(&msg).1 == MessageType::END {
+                    *active.lock().unwrap() = false;
                 }
-                x
+                msg
             })
-            //.peekable()
-            //.peek()
-            //.take_while(async {|msg| {future::ready(game_message_factory.parse_input(msg).1 == MessageType::END)}})
+            .take_until(future::poll_fn(|_| {
+                if *active.lock().unwrap() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }))
             .map(Ok).forward(outgoing);
-        future::select(opponent_messages, feedback)
-    }.await;
+        future::select(opponent_messages, input_processing)
+    };
 
-    pin_mut!(result);
+    //pin_mut!(result);
 
-    result.await;
+    combined_input_output.await;
 
     println!("{} disconnected", &addr);
 
