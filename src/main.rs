@@ -17,7 +17,7 @@ use futures_util::task::SpawnExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-type PeerList = Arc<Mutex<Vec<GameSession>>>;
+type PeerList = Arc<Mutex<Vec<Arc<Mutex<GameSession>>>>>;
 
 #[derive(PartialEq)]
 enum GameSessionPhase {
@@ -45,14 +45,15 @@ struct GameSession {
 }
 
 impl GameSession {
-    fn new() -> GameSession {
+    fn new(sender_a: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>) -> GameSession {
         GameSession {
             board: GameBoard::new(),
-            phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a: None, sender_b: None
+            phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a, sender_b: None
         }
     }
 
     fn start_game(&mut self, game_message_factory: &GameMessageFactory) {
+        println!("Starting game");
         self.phase = GameSessionPhase::PLAYING;
         match &self.sender_a {
             Some(sender) => {
@@ -93,8 +94,7 @@ async fn handle_connection(
     raw_stream: TcpStream,
     addr: SocketAddr,
     peer_list: PeerList,
-    game_message_factory: GameMessageFactory,
-    mut session_index: usize
+    game_message_factory: GameMessageFactory
 ) {
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
         .await
@@ -106,42 +106,37 @@ async fn handle_connection(
     let (outgoing, incoming) = ws_stream.split();
     let (tx, rx) = unbounded();
     let tx = Arc::new(tx);
-
-    let result = async {
-
-        let mut is_player_a = true;
-
-        {
-            let mut sessions = peer_list.lock().unwrap();
-
-            for (i, s) in sessions.iter_mut().enumerate() {
-                session_index = i;
-                if s.phase == GameSessionPhase::LOBBY {
-                    &tx.unbounded_send(
-                        message(&GameMessageFactory::build_plain_message("You just joined an existing game!", MessageType::INFO))
-                    ).unwrap();
-                    s.sender_b = Some((Arc::clone(&tx), addr));
-                    s.start_game(&game_message_factory);
-                    is_player_a = false;
-
-                    break;
-                }
-            }
-
-            if is_player_a {
-                if sessions.len() > 0 { session_index += 1; }
-                let mut s = GameSession::new();
+    let mut is_player_a = true;
+    let gs = {
+        let x = Arc::clone(&peer_list);
+        let mut x = x.lock().unwrap();
+        match x.iter()
+        .find(|s| {s.lock().unwrap().phase == GameSessionPhase::LOBBY}) {
+            Some(&ref el) => {
+                println!("Existing session found");
+                let mut session = el.lock().unwrap();
+                session.sender_b = Some((Arc::clone(&tx), addr));
+                session.start_game(&game_message_factory);
+                is_player_a = false;
+                Arc::clone(&el)
+            },
+            None => {
+                println!("New session required");
+                let out = Arc::new(Mutex::new(GameSession::new(Some((Arc::clone(&tx), addr)))));
+                x.push(Arc::clone(&out));
+                println!("Deadlock");
                 &tx.unbounded_send(
                     message(game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE))
                 ).unwrap();
-                s.sender_a = Some((Arc::clone(&tx), addr));
-                sessions.push(s);
-
-
+                println!("Completed None");
+                out
             }
         }
-        let player =  if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
+    };
 
+    let result = async {
+
+        let player =  if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
 
         let feedback = incoming
             .try_take_while(|_| { future::ok(
@@ -150,7 +145,7 @@ async fn handle_connection(
             .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
             //.try_take_while(|(_, input_type)| {future::ok(input_type != MessageType::END)})
             .try_for_each(|input| {
-                player_feedback(player, input, &game_message_factory, &mut peer_list.lock().unwrap()[session_index]);
+                player_feedback(player, input, &game_message_factory, Arc::clone(&gs));
                 future::ok(())
             });
 
@@ -176,10 +171,10 @@ async fn handle_connection(
 
     let mut x = peer_list.lock().unwrap();
     let res = x.iter_mut().filter(|s| {
-       let stored_addr = s.sender_a.as_ref().unwrap().1; //player A always exist
+       let stored_addr = s.lock().unwrap().sender_a.as_ref().unwrap().1; //player A always exist
        println!("stored addr a is {}, against current addr {}", stored_addr, addr);
         stored_addr == addr || {
-                match s.sender_b.as_ref() { Some(el) => {
+                match s.lock().unwrap().sender_b.as_ref() { Some(el) => {
                     let stored_addr = el.1;
                     println!("stored addr b is {}, against current addr {}", stored_addr, addr);
                     stored_addr == addr
@@ -190,7 +185,7 @@ async fn handle_connection(
     match res {
         Some(el) => {
             println!("Disconnected matched");
-            el.phase = GameSessionPhase::CLOSED;
+            el.lock().unwrap().phase = GameSessionPhase::CLOSED;
         },
         _ => println!("Not cleaned")
     }
@@ -200,9 +195,10 @@ fn player_feedback(
     player: &'static str,
     (input_text, input_type): (String, String),
     game_message_factory: &GameMessageFactory,
-    lobby_session: &mut GameSession
+    lobby_session: Arc<Mutex<GameSession>>
 ) {
-    if lobby_session.update_board(player, &input_text, &input_type) {
+    let mut lobby_session = lobby_session.lock().unwrap();
+    if (*lobby_session).update_board(player, &input_text, &input_type) {
         println!("Board updated!");
         let figure_message = if player == CellOwner::PLAYER_A {
             game_message_factory.get_default(GameMessageFactory::X_FIGURE_MESSAGE)
@@ -268,7 +264,7 @@ async fn main() -> Result<(), IoError> {
             let mut sessions = rc_game_sessions.lock().unwrap();
             println!("Before closed cleanup: {}", sessions.len());
             for (index, el) in sessions.iter().enumerate() {
-                if el.phase == GameSessionPhase::CLOSED {
+                if (*el).lock().unwrap().phase == GameSessionPhase::CLOSED {
                     indexes.push(index);
                 }
             }
@@ -281,7 +277,7 @@ async fn main() -> Result<(), IoError> {
 
     // Let's spawn the handling of each connection in a separate task.
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, addr, game_sessions.clone(), GameMessageFactory::new(), 0));
+        tokio::spawn(handle_connection(stream, addr, game_sessions.clone(), GameMessageFactory::new()));
     }
 
     Ok(())
