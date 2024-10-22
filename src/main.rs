@@ -12,9 +12,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use std::task::Poll;
-use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
-use futures_util::task::SpawnExt;
+use futures_channel::mpsc::{unbounded, TrySendError, UnboundedSender};
+use futures_util::{future, stream::TryStreamExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -31,9 +30,13 @@ fn message(plain: &str) -> Message {
     Message::Text(String::from(plain))
 }
 
+fn sent_fail_notify(_: TrySendError<Message>) {
+    println!("Could not send message.")
+}
+
 fn multi_message_send(sender: &UnboundedSender<Message>, messages: &[&String]) {
     for &plain_message in messages {
-        sender.unbounded_send(message(plain_message)).expect("Failed to send message");
+        sender.unbounded_send(message(plain_message)).unwrap_or_else(sent_fail_notify);
     }
 }
 
@@ -58,12 +61,12 @@ impl GameSession {
         self.phase = GameSessionPhase::PLAYING;
         self.sender_a.unbounded_send(
             message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
-        ).unwrap();
+        ).unwrap_or_else(sent_fail_notify);
         match &self.sender_b {
             Some(sender) => {
                 sender.unbounded_send(
                     message(game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE))
-                ).unwrap();
+                ).unwrap_or_else(sent_fail_notify);
             },
             None => {println!("Non va start game B")}
         }
@@ -119,7 +122,7 @@ async fn handle_connection(
                 sessions.push(Arc::clone(&out));
                 &tx.unbounded_send(
                     message(game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE))
-                ).unwrap();
+                ).unwrap_or_else(sent_fail_notify);
                 out
             }
         }
