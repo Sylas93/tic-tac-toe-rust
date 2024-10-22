@@ -41,12 +41,12 @@ struct GameSession {
     board: GameBoard,
     phase: GameSessionPhase,
     turn: &'static str,
-    sender_a: (Arc<UnboundedSender<Message>>, SocketAddr),
-    sender_b: Option<(Arc<UnboundedSender<Message>>, SocketAddr)>,
+    sender_a: Arc<UnboundedSender<Message>>,
+    sender_b: Option<Arc<UnboundedSender<Message>>>
 }
 
 impl GameSession {
-    fn new(sender_a: (Arc<UnboundedSender<Message>>, SocketAddr)) -> GameSession {
+    fn new(sender_a: Arc<UnboundedSender<Message>>) -> GameSession {
         GameSession {
             board: GameBoard::new(),
             phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a, sender_b: None
@@ -56,12 +56,12 @@ impl GameSession {
     fn start_game(&mut self, game_message_factory: &GameMessageFactory) {
         println!("Starting game");
         self.phase = GameSessionPhase::PLAYING;
-        self.sender_a.0.unbounded_send(
+        self.sender_a.unbounded_send(
             message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
         ).unwrap();
         match &self.sender_b {
             Some(sender) => {
-                sender.0.unbounded_send(
+                sender.unbounded_send(
                     message(game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE))
                 ).unwrap();
             },
@@ -78,9 +78,9 @@ impl GameSession {
 
     fn opponent_sink(&self, player: &str) -> Arc<UnboundedSender<Message>> {
         if player == CellOwner::PLAYER_A {
-            self.sender_b.as_ref().unwrap().0.clone()
+            self.sender_b.as_ref().unwrap().clone()
         } else {
-            self.sender_a.0.clone()
+            self.sender_a.clone()
         }
     }
 }
@@ -108,14 +108,14 @@ async fn handle_connection(
             Some(&ref el) => {
                 println!("Existing session found");
                 let mut session = el.lock().unwrap();
-                session.sender_b = Some((Arc::clone(&tx), addr));
+                session.sender_b = Some(Arc::clone(&tx));
                 session.start_game(&game_message_factory);
                 is_player_a = false;
                 Arc::clone(&el)
             },
             None => {
                 println!("New session required");
-                let out = Arc::new(Mutex::new(GameSession::new((Arc::clone(&tx), addr))));
+                let out = Arc::new(Mutex::new(GameSession::new(Arc::clone(&tx))));
                 sessions.push(Arc::clone(&out));
                 &tx.unbounded_send(
                     message(game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE))
@@ -124,11 +124,9 @@ async fn handle_connection(
             }
         }
     };
+    let player = if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
 
     let combined_input_output = {
-
-        let player =  if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
-
         let input_processing = incoming
             .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
             .try_for_each(|input| {
@@ -136,7 +134,7 @@ async fn handle_connection(
                 future::ok(())
             });
 
-        let opponent_messages = rx
+        let output_stream = rx
             .map(|msg| {
                 if game_message_factory.parse_input(&msg).1 == MessageType::END {
                     *active.lock().unwrap() = false;
@@ -151,34 +149,25 @@ async fn handle_connection(
                 }
             }))
             .map(Ok).forward(outgoing);
-        future::select(opponent_messages, input_processing)
+        future::select(output_stream, input_processing)
     };
-
-    //pin_mut!(result);
 
     combined_input_output.await;
 
     println!("{} disconnected", &addr);
 
-    let mut x = peer_list.lock().unwrap();
-    let res = x.iter_mut().filter(|s| {
-       let stored_addr = s.lock().unwrap().sender_a.1; //player A always exist
-       println!("stored addr a is {}, against current addr {}", stored_addr, addr);
-        stored_addr == addr || {
-                match s.lock().unwrap().sender_b.as_ref() { Some(el) => {
-                    let stored_addr = el.1;
-                    println!("stored addr b is {}, against current addr {}", stored_addr, addr);
-                    stored_addr == addr
-                } , None => false }
+    let mut gs = gs.lock().unwrap();
+
+    if gs.phase == GameSessionPhase::CLOSED {
+        println!("Nothing to do, session already closed");
+    } else {
+        println!("Player let game before end");
+        if gs.phase == GameSessionPhase::PLAYING { // if playing there must be an opponent, otherwise panic
+            gs.opponent_sink(player)
+                .unbounded_send(message(game_message_factory.get_default(GameMessageFactory::WITHDRAWAL_MESSAGE)))
+                .unwrap_or_else(sent_fail_notify);
         }
-    }
-    ).take(1).next();
-    match res {
-        Some(el) => {
-            println!("Disconnected matched");
-            el.lock().unwrap().phase = GameSessionPhase::CLOSED;
-        },
-        _ => println!("Not cleaned")
+        gs.phase = GameSessionPhase::CLOSED;
     }
 }
 
@@ -186,10 +175,10 @@ fn player_feedback(
     player: &'static str,
     (input_text, input_type): (String, String),
     game_message_factory: &GameMessageFactory,
-    lobby_session: Arc<Mutex<GameSession>>
+    game_session: Arc<Mutex<GameSession>>
 ) {
-    let mut lobby_session = lobby_session.lock().unwrap();
-    if (*lobby_session).update_board(player, &input_text, &input_type) {
+    let mut game_session = game_session.lock().unwrap();
+    if (*game_session).update_board(player, &input_text, &input_type) {
         println!("Board updated!");
         let figure_message = if player == CellOwner::PLAYER_A {
             game_message_factory.get_default(GameMessageFactory::X_FIGURE_MESSAGE)
@@ -197,39 +186,39 @@ fn player_feedback(
             game_message_factory.get_default(GameMessageFactory::O_FIGURE_MESSAGE)
         };
         let show_message = &GameMessageFactory::build_plain_message(&input_text, MessageType::SHOW);
-        let winner = lobby_session.board.check_winner();
+        let winner = game_session.board.check_winner();
         if winner == CellOwner::NONE {
-            lobby_session.turn = CellOwner::opponent(lobby_session.turn);
+            game_session.turn = CellOwner::opponent(game_session.turn);
             multi_message_send(
-                &*lobby_session.opponent_sink(player),
+                &*game_session.opponent_sink(player),
                 &[figure_message, show_message,
                     game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE)]
             );
             multi_message_send(
-                &*lobby_session.opponent_sink(CellOwner::opponent(player)),
+                &*game_session.opponent_sink(CellOwner::opponent(player)),
                 &[figure_message, show_message,
                     game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE)]
             );
         } else if winner == player {
-            lobby_session.phase = GameSessionPhase::CLOSED;
+            game_session.phase = GameSessionPhase::CLOSED;
             multi_message_send(
-                &*lobby_session.opponent_sink(player),
+                &*game_session.opponent_sink(player),
                 &[figure_message, show_message,
                     game_message_factory.get_default(GameMessageFactory::LOST_MESSAGE)]
             );
             multi_message_send(
-                &*lobby_session.opponent_sink(CellOwner::opponent(player)),
+                &*game_session.opponent_sink(CellOwner::opponent(player)),
                 &[figure_message, show_message,
                     game_message_factory.get_default(GameMessageFactory::WIN_MESSAGE)]
             );
         } else if winner == CellOwner::TIE {
-            lobby_session.phase = GameSessionPhase::CLOSED;
+            game_session.phase = GameSessionPhase::CLOSED;
             let tie_messages = &[figure_message, show_message,
                 game_message_factory.get_default(GameMessageFactory::TIE_MESSAGE)];
             multi_message_send(
-                &*lobby_session.opponent_sink(player), tie_messages);
+                &*game_session.opponent_sink(player), tie_messages);
             multi_message_send(
-                &*lobby_session.opponent_sink(CellOwner::opponent(player)), tie_messages);
+                &*game_session.opponent_sink(CellOwner::opponent(player)), tie_messages);
         }
     }
 }
