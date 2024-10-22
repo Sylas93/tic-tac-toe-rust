@@ -58,16 +58,21 @@ impl GameMessageFactory {
     pub fn parse_input(&self, input: &Message) -> (String, String) {
         let input_text = input.to_text().unwrap();
         println!("Received a message: {}", input_text);
-        let v: Value = serde_json::from_str(input_text).unwrap();
-        let input_text = match v.get("text").unwrap() {
-            JsonString(str) => String::from(str),
-            _ => panic!("Invalid text from client")
-        };
-        let input_type= match v.get("type").unwrap() {
-            JsonString(str) =>  String::from(str),
-            _ => panic!("Invalid type from client")
-        };
-        (input_text, input_type)
+        let parsed: Result<Value,_ > = serde_json::from_str(input_text);
+        match parsed{
+            Ok(json) => {
+                let input_text = match json.get("text").unwrap() {
+                    JsonString(str) => String::from(str),
+                    _ => panic!("Invalid text from client")
+                };
+                let input_type= match json.get("type").unwrap() {
+                    JsonString(str) =>  String::from(str),
+                    _ => panic!("Invalid type from client")
+                };
+                (input_text, input_type)
+            },
+            Err(_) => (String::from("Unexpected input"), String::from(MessageType::ERROR))
+        }
     }
 
     pub fn build_plain_message(m: &str, t: &str) -> String {
