@@ -246,9 +246,11 @@ async fn main() -> Result<(), IoError> {
             let mut indexes = Vec::new();
             let mut sessions = rc_game_sessions.lock().unwrap();
             println!("Before closed cleanup: {}", sessions.len());
+            let mut counter = 0;
             for (index, el) in sessions.iter().enumerate() {
                 if (*el).lock().unwrap().phase == GameSessionPhase::CLOSED {
-                    indexes.push(index);
+                    indexes.push(index - counter);
+                    counter += 1;
                 }
             }
             for i in indexes {
