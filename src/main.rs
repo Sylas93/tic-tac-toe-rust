@@ -165,10 +165,7 @@ async fn handle_connection(
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let resources = StaticResource::new().await;
-    let homepage = &resources.homepage;
-    let javascript = &resources.javascript;
-    let image = &resources.empty_cell[..];
+    let resources = StaticResource::new().await; // loads static resources only once
 
     let game_sessions = PeerList::new(Mutex::new(Vec::with_capacity(6)));
     let rc_game_sessions = Arc::clone(&game_sessions);
@@ -280,6 +277,16 @@ async fn handle_request(
             *res.status_mut() = StatusCode::OK;
             res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
             return Ok(res);
+        } else if req.method() == Method::GET && req.uri() == "/grid.css" {
+            let mut res = Response::new(Body::from(&resources.css[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "text/css".parse().unwrap());
+            return Ok(res);
+        } else if req.method() == Method::GET && req.uri() == "/images/favicon.png" {
+            let mut res = Response::new(Body::from(&resources.favicon[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/png".parse().unwrap());
+            return Ok(res);
         } else {
             return Ok(Response::new(Body::from(&resources.homepage[..])));
         };
@@ -326,6 +333,8 @@ struct StaticResource {
     empty_cell: Vec<u8>,
     x_cell: Vec<u8>,
     o_cell: Vec<u8>,
+    css: Vec<u8>,
+    favicon: Vec<u8>,
 }
 
 impl StaticResource {
@@ -337,6 +346,8 @@ impl StaticResource {
                     empty_cell: read_resource("src/static/images/empty-cell.jpg"),
                     x_cell: read_resource("src/static/images/x-cell.jpg"),
                     o_cell: read_resource("src/static/images/o-cell.jpg"),
+                    css: read_resource("src/static/grid.css"),
+                    favicon: read_resource("src/static/images/favicon.png"),
                 }
         }).await
     }
