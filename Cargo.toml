@@ -9,3 +9,9 @@ futures-channel = "0.3.31"
 futures-util = "0.3.31"
 tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros", "time"] }
 serde_json = "1.0.129"
+hyper = "1.5.0"
+hyper-util = { version = "0.1.9", features = ["full"] }
+http-body-util = "0.1.2"
+tokio-util = "0.7.12"
+tungstenite = "0.24.0"
+bytes = "1.8.0"

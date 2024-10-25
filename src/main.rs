@@ -1,23 +1,52 @@
 mod board;
 mod message;
+mod session;
 
-use board::{CellOwner, GameBoard};
+use hyper_util::rt::TokioIo;
+
+use session::GameSession;
+use board::{CellOwner};
 use message::{GameMessageFactory, MessageType};
 
 use std::{
+    fs,
     time::Duration,
     env,
     io::Error as IoError,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+use std::convert::Infallible;
 use std::task::Poll;
 use futures_channel::mpsc::{unbounded, TrySendError, UnboundedSender};
 use futures_util::{future, stream::TryStreamExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::protocol::Message;
+
+use hyper::{
+    body::Incoming,
+    header::{
+        HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
+        UPGRADE,
+    },
+    server::conn::http1,
+    service::service_fn,
+    upgrade::Upgraded,
+    Method, Request, Response, StatusCode, Version,
+};
+use hyper::header::CONTENT_TYPE;
+use hyper::http::method::InvalidMethod;
+use tokio_tungstenite::{
+    tungstenite::{
+        handshake::derive_accept_key,
+        protocol::{Message, Role},
+    },
+    WebSocketStream,
+};
+
+use tokio::net::{TcpListener};
+use tokio::sync::OnceCell;
 
 type PeerList = Arc<Mutex<Vec<Arc<Mutex<GameSession>>>>>;
+type Body = http_body_util::Full<hyper::body::Bytes>;
 
 #[derive(PartialEq)]
 enum GameSessionPhase {
@@ -40,63 +69,21 @@ fn multi_message_send(sender: &UnboundedSender<Message>, messages: &[&String]) {
     }
 }
 
-struct GameSession {
-    board: GameBoard,
-    phase: GameSessionPhase,
-    turn: &'static str,
-    sender_a: Arc<UnboundedSender<Message>>,
-    sender_b: Option<Arc<UnboundedSender<Message>>>
-}
-
-impl GameSession {
-    fn new(sender_a: Arc<UnboundedSender<Message>>) -> GameSession {
-        GameSession {
-            board: GameBoard::new(),
-            phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a, sender_b: None
-        }
-    }
-
-    fn start_game(&mut self, game_message_factory: &GameMessageFactory) {
-        println!("Starting game");
-        self.phase = GameSessionPhase::PLAYING;
-        self.sender_a.unbounded_send(
-            message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
-        ).unwrap_or_else(sent_fail_notify);
-        match &self.sender_b {
-            Some(sender) => {
-                sender.unbounded_send(
-                    message(game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE))
-                ).unwrap_or_else(sent_fail_notify);
-            },
-            None => {println!("Non va start game B")}
-        }
-    }
-
-    fn update_board(&mut self, player: &'static str, message_text: &String, message_type: &String) -> bool {
-        self.phase == GameSessionPhase::PLAYING &&
-            self.turn == player &&
-            message_type == MessageType::CLIENT_CLICK &&
-            self.board.update_cell(message_text.parse().unwrap(), player)
-    }
-
-    fn opponent_sink(&self, player: &str) -> Arc<UnboundedSender<Message>> {
-        if player == CellOwner::PLAYER_A {
-            self.sender_b.as_ref().unwrap().clone()
-        } else {
-            self.sender_a.clone()
-        }
-    }
-}
-
 async fn handle_connection(
-    raw_stream: TcpStream,
+    ws_stream: WebSocketStream<TokioIo<Upgraded>>,
     addr: SocketAddr,
     peer_list: PeerList,
-    game_message_factory: GameMessageFactory
+    game_message_factory: Arc<GameMessageFactory>
 ) {
+    /*
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
+        .await;
+    if ws_stream.is_err() {
+        println!("Error during the websocket handshake occurred");
+        return;
+    }
+    let ws_stream = ws_stream.expect("Already verified");
+    */
     println!("WebSocket connection established: {}", addr);
     let active = Arc::new(Mutex::new(true));
 
@@ -133,7 +120,8 @@ async fn handle_connection(
         let input_processing = incoming
             .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
             .try_for_each(|input| {
-                player_feedback(player, input, &game_message_factory, Arc::clone(&gs));
+               let mut game_session = gs.lock().unwrap();
+                game_session.process_player_input(player, input, &game_message_factory);
                 future::ok(())
             });
 
@@ -174,61 +162,13 @@ async fn handle_connection(
     }
 }
 
-fn player_feedback(
-    player: &'static str,
-    (input_text, input_type): (String, String),
-    game_message_factory: &GameMessageFactory,
-    game_session: Arc<Mutex<GameSession>>
-) {
-    let mut game_session = game_session.lock().unwrap();
-    if (*game_session).update_board(player, &input_text, &input_type) {
-        println!("Board updated!");
-        let figure_message = if player == CellOwner::PLAYER_A {
-            game_message_factory.get_default(GameMessageFactory::X_FIGURE_MESSAGE)
-        } else {
-            game_message_factory.get_default(GameMessageFactory::O_FIGURE_MESSAGE)
-        };
-        let show_message = &GameMessageFactory::build_plain_message(&input_text, MessageType::SHOW);
-        let winner = game_session.board.check_winner();
-        if winner == CellOwner::NONE {
-            game_session.turn = CellOwner::opponent(game_session.turn);
-            multi_message_send(
-                &*game_session.opponent_sink(player),
-                &[figure_message, show_message,
-                    game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE)]
-            );
-            multi_message_send(
-                &*game_session.opponent_sink(CellOwner::opponent(player)),
-                &[figure_message, show_message,
-                    game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE)]
-            );
-        } else if winner == player {
-            game_session.phase = GameSessionPhase::CLOSED;
-            multi_message_send(
-                &*game_session.opponent_sink(player),
-                &[figure_message, show_message,
-                    game_message_factory.get_default(GameMessageFactory::LOST_MESSAGE)]
-            );
-            multi_message_send(
-                &*game_session.opponent_sink(CellOwner::opponent(player)),
-                &[figure_message, show_message,
-                    game_message_factory.get_default(GameMessageFactory::WIN_MESSAGE)]
-            );
-        } else if winner == CellOwner::TIE {
-            game_session.phase = GameSessionPhase::CLOSED;
-            let tie_messages = &[figure_message, show_message,
-                game_message_factory.get_default(GameMessageFactory::TIE_MESSAGE)];
-            multi_message_send(
-                &*game_session.opponent_sink(player), tie_messages);
-            multi_message_send(
-                &*game_session.opponent_sink(CellOwner::opponent(player)), tie_messages);
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let resources = StaticResource::new().await;
+    let homepage = &resources.homepage;
+    let javascript = &resources.javascript;
+    let image = &resources.empty_cell[..];
 
     let game_sessions = PeerList::new(Mutex::new(Vec::with_capacity(6)));
     let rc_game_sessions = Arc::clone(&game_sessions);
@@ -259,11 +199,147 @@ async fn main() -> Result<(), IoError> {
             println!("After closed cleanup: {}", sessions.len());
         }
     });
-
+    let game_message_factory = Arc::new(GameMessageFactory::new());
     // Let's spawn the handling of each connection in a separate task.
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, addr, game_sessions.clone(), GameMessageFactory::new()));
+
+        let game_sessions = game_sessions.clone();
+        let game_message_factory = Arc::clone(&game_message_factory); // other way of cloning
+
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let conn = http1::Builder::new()
+                .serve_connection(io, service_fn(
+                    move |req|
+                        handle_request(req, addr, game_sessions.clone(), game_message_factory.clone(), resources)
+                ))
+                .with_upgrades();
+            if let Err(err) = conn.await {
+                eprintln!("failed to serve connection: {err:?}");
+            }
+        });
+        //tokio::spawn(handle_connection(stream, addr, game_sessions.clone(), Arc::clone(&game_message_factory)));
     }
 
     Ok(())
 }
+
+async fn handle_request(
+    mut req: Request<Incoming>,
+    addr: SocketAddr,
+    peer_list: PeerList,
+    game_message_factory: Arc<GameMessageFactory>,
+    resources: &'static StaticResource
+) -> Result<Response<Body>, Infallible> {
+    println!("The request's path is: {}", req.uri().path());
+    println!("The request's headers are:");
+    for (ref header, _value) in req.headers() {
+        println!("* {}", header);
+    }
+    let upgrade = HeaderValue::from_static("Upgrade");
+    let websocket = HeaderValue::from_static("websocket");
+    let headers = req.headers();
+    let key = headers.get(SEC_WEBSOCKET_KEY);
+    let derived = key.map(|k| derive_accept_key(k.as_bytes()));
+    if req.method() != Method::GET
+        || req.version() < Version::HTTP_11
+        || !headers
+        .get(CONNECTION)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| {
+            h.split(|c| c == ' ' || c == ',')
+                .any(|p| p.eq_ignore_ascii_case(upgrade.to_str().unwrap()))
+        })
+        .unwrap_or(false)
+        || !headers
+        .get(UPGRADE)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+        || !headers.get(SEC_WEBSOCKET_VERSION).map(|h| h == "13").unwrap_or(false)
+        || key.is_none()
+        || req.uri() != "/socket"
+    {
+        if req.method() == Method::GET && req.uri() == "/app.js" {
+            let mut res = Response::new(Body::from(&resources.javascript[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "application/javascript".parse().unwrap());
+            return Ok(res);
+        } else if req.method() == Method::GET && req.uri() == "/images/empty-cell.jpg" {
+            let mut res = Response::new(Body::from(&resources.empty_cell[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            return Ok(res);
+        } else if req.method() == Method::GET && req.uri() == "/images/x-cell.jpg" {
+            let mut res = Response::new(Body::from(&resources.x_cell[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            return Ok(res);
+        } else if req.method() == Method::GET && req.uri() == "/images/o-cell.jpg" {
+            let mut res = Response::new(Body::from(&resources.o_cell[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            return Ok(res);
+        } else {
+            return Ok(Response::new(Body::from(&resources.homepage[..])));
+        };
+    }
+
+    println!("Received a new ws handshake");
+    let ver = req.version();
+    tokio::task::spawn(async move {
+        match hyper::upgrade::on(&mut req).await {
+            Ok(upgraded) => {
+                let upgraded = TokioIo::new(upgraded);
+                handle_connection(
+                    WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await,
+                    addr,
+                    peer_list,
+                    game_message_factory
+                )
+                    .await;
+            }
+            Err(e) => println!("upgrade error: {}", e),
+        }
+    });
+    let mut res = Response::new(Body::default());
+    *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *res.version_mut() = ver;
+    res.headers_mut().append(CONNECTION, upgrade);
+    res.headers_mut().append(UPGRADE, websocket);
+    res.headers_mut().append(SEC_WEBSOCKET_ACCEPT, derived.unwrap().parse().unwrap());
+    // Let's add an additional header to our response to the client.
+    res.headers_mut().append("MyCustomHeader", ":)".parse().unwrap());
+    res.headers_mut().append("SOME_TUNGSTENITE_HEADER", "header_value".parse().unwrap());
+    Ok(res)
+}
+
+static NOTFOUND: &[u8] = b"Not Found";
+
+fn read_resource(resource_path: &str) -> Vec<u8> {
+    fs::read(resource_path).expect("Could not load resources")
+}
+
+struct StaticResource {
+    homepage: Vec<u8>,
+    javascript: Vec<u8>,
+    empty_cell: Vec<u8>,
+    x_cell: Vec<u8>,
+    o_cell: Vec<u8>,
+}
+
+impl StaticResource {
+    async fn new() -> &'static StaticResource {
+        STATIC_RESOURCE.get_or_init(|| async {
+                StaticResource {
+                    homepage: read_resource("src/static/index.html"),
+                    javascript: read_resource("src/static/app.js"),
+                    empty_cell: read_resource("src/static/images/empty-cell.jpg"),
+                    x_cell: read_resource("src/static/images/x-cell.jpg"),
+                    o_cell: read_resource("src/static/images/o-cell.jpg"),
+                }
+        }).await
+    }
+}
+
+static STATIC_RESOURCE: OnceCell<StaticResource> = OnceCell::const_new();
