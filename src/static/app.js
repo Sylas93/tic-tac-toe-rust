@@ -20,7 +20,7 @@ function initialize() {
 }
 
 function connectSocket() {
-    socketConnection = webSocket("ws://127.0.0.1:8080/socket");
+    socketConnection = webSocket('SOCKET_HOST');
     socketConnection.subscribe({
         next: msg => handleNext(msg), // Called whenever there is a message from the server.
         error: err => handleError(err), // Called if at any point WebSocket API signals some kind of error.

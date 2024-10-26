@@ -165,15 +165,26 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
-    let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let resources = StaticResource::new().await; // loads static resources only once
+    let port = env::var("PORT")
+        .unwrap_or_else(|_| String::from("8080"));
+    let mut js_socket_endpoint = env::var("SOCKET_HOST")
+        .unwrap_or_else(|_| {
+            let mut fallback_endpoint = String::from("ws://127.0.0.1:");
+            fallback_endpoint.push_str(&port);
+            fallback_endpoint
+        });
+    js_socket_endpoint.push_str("/socket");
+    let mut listening_addr = String::from("127.0.0.1:");
+    listening_addr.push_str(&port);
+
+    let resources = StaticResource::new(&js_socket_endpoint).await; // loads static resources only once
 
     let game_sessions = PeerList::new(Mutex::new(Vec::with_capacity(6)));
     let rc_game_sessions = Arc::clone(&game_sessions);
     // Create the event loop and TCP listener we'll accept connections on.
-    let try_socket = TcpListener::bind(&addr).await;
+    let try_socket = TcpListener::bind(&listening_addr).await;
     let listener = try_socket.expect("Failed to bind");
-    println!("Listening on: {}", addr);
+    println!("Listening on: {}", listening_addr);
 
     // clean closed games
     tokio::spawn(async move {
