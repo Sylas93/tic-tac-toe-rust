@@ -174,7 +174,7 @@ async fn main() -> Result<(), IoError> {
             fallback_endpoint
         });
     js_socket_endpoint.push_str("/socket");
-    let mut listening_addr = String::from("127.0.0.1:");
+    let mut listening_addr = String::from("0.0.0.0:");
     listening_addr.push_str(&port);
 
     let resources = StaticResource::new(&js_socket_endpoint).await; // loads static resources only once
