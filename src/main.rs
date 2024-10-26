@@ -10,7 +10,6 @@ use board::{CellOwner};
 use message::{GameMessageFactory, MessageType};
 
 use std::{
-    fs,
     time::Duration,
     env,
     io::Error as IoError,
@@ -34,7 +33,6 @@ use hyper::{
     Method, Request, Response, StatusCode, Version,
 };
 use hyper::header::CONTENT_TYPE;
-use hyper::http::method::InvalidMethod;
 use tokio_tungstenite::{
     tungstenite::{
         handshake::derive_accept_key,
@@ -76,15 +74,6 @@ async fn handle_connection(
     peer_list: PeerList,
     game_message_factory: Arc<GameMessageFactory>
 ) {
-    /*
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await;
-    if ws_stream.is_err() {
-        println!("Error during the websocket handshake occurred");
-        return;
-    }
-    let ws_stream = ws_stream.expect("Already verified");
-    */
     println!("WebSocket connection established: {}", addr);
     let active = Arc::new(Mutex::new(true));
 
@@ -329,7 +318,3 @@ async fn handle_request(
     res.headers_mut().append(SEC_WEBSOCKET_ACCEPT, derived.unwrap().parse().unwrap());
     Ok(res)
 }
-
-static NOTFOUND: &[u8] = b"Not Found";
-
-
