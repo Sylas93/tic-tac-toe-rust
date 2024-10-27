@@ -1,9 +1,15 @@
-use std::sync::{Arc};
+use std::sync::Arc;
 use futures_channel::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::Message;
 use crate::board::{CellOwner, GameBoard};
-use crate::{message, multi_message_send, sent_fail_notify, GameSessionPhase};
-use crate::message::{GameMessageFactory, MessageType};
+use crate::message::{message_send, multi_message_send, GameMessageFactory, MessageType};
+
+#[derive(PartialEq)]
+pub enum GameSessionPhase {
+    LOBBY,
+    PLAYING,
+    CLOSED
+}
 
 pub struct GameSession {
     pub(crate) board: GameBoard,
@@ -24,16 +30,12 @@ impl GameSession {
     pub fn start_game(&mut self, game_message_factory: &GameMessageFactory) {
         println!("Starting game");
         self.phase = GameSessionPhase::PLAYING;
-        self.sender_a.unbounded_send(
-            message(game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE))
-        ).unwrap_or_else(sent_fail_notify);
+        message_send(&self.sender_a, game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE));
         match &self.sender_b {
             Some(sender) => {
-                sender.unbounded_send(
-                    message(game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE))
-                ).unwrap_or_else(sent_fail_notify);
+                message_send(sender, game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE));
             },
-            None => {println!("Non va start game B")}
+            None => {println!("Error starting game B")}
         }
     }
 
@@ -88,11 +90,15 @@ impl GameSession {
         }
     }
 
-    pub fn opponent_sink(&self, player: &str) -> Arc<UnboundedSender<Message>> {
-        if player == CellOwner::PLAYER_A {
-            self.sender_b.as_ref().unwrap().clone()
+    pub fn close_session(&mut self, player: &str, game_message_factory: &GameMessageFactory) {
+        if self.phase == GameSessionPhase::CLOSED {
+            println!("Nothing to do, session already closed");
         } else {
-            self.sender_a.clone()
+            println!("Player let game before end");
+            if self.phase == GameSessionPhase::PLAYING { // if playing there must be an opponent, otherwise panic
+                message_send(&self.opponent_sink(player), game_message_factory.get_default(GameMessageFactory::WITHDRAWAL_MESSAGE));
+            }
+            self.phase = GameSessionPhase::CLOSED;
         }
     }
 
@@ -101,5 +107,13 @@ impl GameSession {
             self.turn == player &&
             message_type == MessageType::CLIENT_CLICK &&
             self.board.update_cell(message_text.parse().unwrap(), player)
+    }
+
+    fn opponent_sink(&self, player: &str) -> Arc<UnboundedSender<Message>> {
+        if player == CellOwner::PLAYER_A {
+            self.sender_b.as_ref().unwrap().clone()
+        } else {
+            self.sender_a.clone()
+        }
     }
 }

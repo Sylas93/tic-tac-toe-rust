@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use serde_json::{Value::String as JsonString, Value};
+use serde_json::{Value, Value::String as JsonString};
+use futures_channel::mpsc::{TrySendError, UnboundedSender};
 
 #[non_exhaustive]
 pub struct MessageType;
@@ -81,4 +82,22 @@ impl GameMessageFactory {
         println!("The resulting message is: {message}");
         message
     }
+}
+
+pub fn multi_message_send(sender: &UnboundedSender<Message>, plain_messages: &[&String]) {
+    for &plain_message in plain_messages {
+        message_send(sender, plain_message);
+    }
+}
+
+pub fn message_send(sender: &UnboundedSender<Message>, plain_message: &String) {
+    sender.unbounded_send(ws_message_of(plain_message)).unwrap_or_else(sent_fail_notify);
+}
+
+fn ws_message_of(plain: &str) -> Message {
+    Message::Text(String::from(plain))
+}
+
+fn sent_fail_notify(_: TrySendError<Message>) {
+    println!("Could not send message.")
 }

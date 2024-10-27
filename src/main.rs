@@ -5,70 +5,43 @@ mod resources;
 
 use hyper_util::rt::TokioIo;
 
-use session::GameSession;
-use board::{CellOwner};
+use session::{GameSession, GameSessionPhase};
+use board::CellOwner;
 use message::{GameMessageFactory, MessageType};
 
 use std::{
-    time::Duration,
     env,
     io::Error as IoError,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use std::convert::Infallible;
 use std::task::Poll;
-use futures_channel::mpsc::{unbounded, TrySendError, UnboundedSender};
+use futures_channel::mpsc::unbounded;
 use futures_util::{future, stream::TryStreamExt, StreamExt};
 
-use hyper::{
-    body::Incoming,
-    header::{
-        HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
-        UPGRADE,
-    },
-    server::conn::http1,
-    service::service_fn,
-    upgrade::Upgraded,
-    Method, Request, Response, StatusCode, Version,
-};
+use hyper::{body::Incoming, header::{
+    HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
+    UPGRADE,
+}, server::conn::http1, service::service_fn, upgrade::Upgraded, HeaderMap, Method, Request, Response, StatusCode, Version};
 use hyper::header::CONTENT_TYPE;
 use tokio_tungstenite::{
     tungstenite::{
         handshake::derive_accept_key,
-        protocol::{Message, Role},
+        protocol::Role,
     },
     WebSocketStream,
 };
 
-use tokio::net::{TcpListener};
+use tokio::net::TcpListener;
+use crate::message::message_send;
 use crate::resources::StaticResource;
 
 type PeerList = Arc<Mutex<Vec<Arc<Mutex<GameSession>>>>>;
 type Body = http_body_util::Full<hyper::body::Bytes>;
 
-#[derive(PartialEq)]
-enum GameSessionPhase {
-    LOBBY,
-    PLAYING,
-    CLOSED
-}
-
-fn message(plain: &str) -> Message {
-    Message::Text(String::from(plain))
-}
-
-fn sent_fail_notify(_: TrySendError<Message>) {
-    println!("Could not send message.")
-}
-
-fn multi_message_send(sender: &UnboundedSender<Message>, messages: &[&String]) {
-    for &plain_message in messages {
-        sender.unbounded_send(message(plain_message)).unwrap_or_else(sent_fail_notify);
-    }
-}
-
-async fn handle_connection(
+async fn handle_websocket(
     ws_stream: WebSocketStream<TokioIo<Upgraded>>,
     addr: SocketAddr,
     peer_list: PeerList,
@@ -97,9 +70,7 @@ async fn handle_connection(
                 println!("New session required");
                 let out = Arc::new(Mutex::new(GameSession::new(Arc::clone(&tx))));
                 sessions.push(Arc::clone(&out));
-                &tx.unbounded_send(
-                    message(game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE))
-                ).unwrap_or_else(sent_fail_notify);
+                message_send(&tx, game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE));
                 out
             }
         }
@@ -138,22 +109,52 @@ async fn handle_connection(
     println!("{} disconnected", &addr);
 
     let mut gs = gs.lock().unwrap();
-
-    if gs.phase == GameSessionPhase::CLOSED {
-        println!("Nothing to do, session already closed");
-    } else {
-        println!("Player let game before end");
-        if gs.phase == GameSessionPhase::PLAYING { // if playing there must be an opponent, otherwise panic
-            gs.opponent_sink(player)
-                .unbounded_send(message(game_message_factory.get_default(GameMessageFactory::WITHDRAWAL_MESSAGE)))
-                .unwrap_or_else(sent_fail_notify);
-        }
-        gs.phase = GameSessionPhase::CLOSED;
-    }
+    gs.close_session(player, &game_message_factory);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
+    let (js_socket_endpoint, listening_addr) = addresses();
+
+    // Loads static resources only once
+    let resources = StaticResource::new(&js_socket_endpoint).await;
+
+    let game_sessions = PeerList::new(Mutex::new(Vec::with_capacity(6)));
+
+    // Create the event loop and TCP listener we'll accept connections on.
+    let try_socket = TcpListener::bind(&listening_addr).await;
+    let listener = try_socket.expect("Failed to bind");
+    println!("Listening on: {}", listening_addr);
+
+    // Clean closed games job
+    clean_closed_sessions(Arc::clone(&game_sessions));
+
+    let game_message_factory = Arc::new(GameMessageFactory::new());
+
+    // Let's spawn the handling of each connection in a separate task.
+    while let Ok((stream, addr)) = listener.accept().await {
+
+        let game_sessions = game_sessions.clone();
+        let game_message_factory = Arc::clone(&game_message_factory); // other way of cloning
+
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let conn = http1::Builder::new()
+                .serve_connection(io, service_fn(
+                    move |req|
+                        handle_request(req, addr, game_sessions.clone(), game_message_factory.clone(), resources)
+                ))
+                .with_upgrades();
+            if let Err(err) = conn.await {
+                eprintln!("failed to serve connection: {err:?}");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn addresses() -> (String, String) {
     let port = env::var("PORT")
         .unwrap_or_else(|_| String::from("8080"));
     let mut js_socket_endpoint = env::var("SOCKET_HOST")
@@ -165,17 +166,10 @@ async fn main() -> Result<(), IoError> {
     js_socket_endpoint.push_str("/socket");
     let mut listening_addr = String::from("0.0.0.0:");
     listening_addr.push_str(&port);
+    (js_socket_endpoint, listening_addr)
+}
 
-    let resources = StaticResource::new(&js_socket_endpoint).await; // loads static resources only once
-
-    let game_sessions = PeerList::new(Mutex::new(Vec::with_capacity(6)));
-    let rc_game_sessions = Arc::clone(&game_sessions);
-    // Create the event loop and TCP listener we'll accept connections on.
-    let try_socket = TcpListener::bind(&listening_addr).await;
-    let listener = try_socket.expect("Failed to bind");
-    println!("Listening on: {}", listening_addr);
-
-    // clean closed games
+fn clean_closed_sessions(rc_game_sessions: Arc<Mutex<Vec<Arc<Mutex<GameSession>>>>>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(5000));
         loop {
@@ -197,29 +191,6 @@ async fn main() -> Result<(), IoError> {
             println!("After closed cleanup: {}", sessions.len());
         }
     });
-    let game_message_factory = Arc::new(GameMessageFactory::new());
-    // Let's spawn the handling of each connection in a separate task.
-    while let Ok((stream, addr)) = listener.accept().await {
-
-        let game_sessions = game_sessions.clone();
-        let game_message_factory = Arc::clone(&game_message_factory); // other way of cloning
-
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let conn = http1::Builder::new()
-                .serve_connection(io, service_fn(
-                    move |req|
-                        handle_request(req, addr, game_sessions.clone(), game_message_factory.clone(), resources)
-                ))
-                .with_upgrades();
-            if let Err(err) = conn.await {
-                eprintln!("failed to serve connection: {err:?}");
-            }
-        });
-        //tokio::spawn(handle_connection(stream, addr, game_sessions.clone(), Arc::clone(&game_message_factory)));
-    }
-
-    Ok(())
 }
 
 async fn handle_request(
@@ -229,17 +200,50 @@ async fn handle_request(
     game_message_factory: Arc<GameMessageFactory>,
     resources: &'static StaticResource
 ) -> Result<Response<Body>, Infallible> {
-    println!("The request's path is: {}", req.uri().path());
-    println!("The request's headers are:");
-    for (ref header, _value) in req.headers() {
-        println!("* {}", header);
-    }
+
     let upgrade = HeaderValue::from_static("Upgrade");
     let websocket = HeaderValue::from_static("websocket");
     let headers = req.headers();
     let key = headers.get(SEC_WEBSOCKET_KEY);
     let derived = key.map(|k| derive_accept_key(k.as_bytes()));
-    if req.method() != Method::GET
+
+    if is_not_socket_request(&req, &upgrade, headers, key)
+    {
+        handle_http_request(&req, resources)
+    } else {
+        println!("Received a new ws handshake");
+        let ver = req.version();
+        tokio::task::spawn(async move {
+            match hyper::upgrade::on(&mut req).await {
+                Ok(upgraded) => {
+                    let upgraded = TokioIo::new(upgraded);
+                    handle_websocket(
+                        WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await,
+                        addr,
+                        peer_list,
+                        game_message_factory
+                    )
+                        .await;
+                }
+                Err(e) => println!("upgrade error: {}", e),
+            }
+        });
+        websocket_handshake(ver, upgrade, websocket, derived)
+    }
+}
+
+fn websocket_handshake(ver: Version, upgrade: HeaderValue, websocket: HeaderValue, derived: Option<String>) -> Result<Response<Body>, Infallible> {
+    let mut res = Response::new(Body::default());
+    *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *res.version_mut() = ver;
+    res.headers_mut().append(CONNECTION, upgrade);
+    res.headers_mut().append(UPGRADE, websocket);
+    res.headers_mut().append(SEC_WEBSOCKET_ACCEPT, derived.unwrap().parse().unwrap());
+    Ok(res)
+}
+
+fn is_not_socket_request(req: &Request<Incoming>, upgrade: &HeaderValue, headers: &HeaderMap, key: Option<&HeaderValue>) -> bool {
+    req.method() != Method::GET
         || req.version() < Version::HTTP_11
         || !headers
         .get(CONNECTION)
@@ -257,64 +261,40 @@ async fn handle_request(
         || !headers.get(SEC_WEBSOCKET_VERSION).map(|h| h == "13").unwrap_or(false)
         || key.is_none()
         || req.uri() != "/socket"
-    {
-        if req.method() == Method::GET && req.uri() == "/app.js" {
-            let mut res = Response::new(Body::from(&resources.javascript[..]));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().append(CONTENT_TYPE, "application/javascript".parse().unwrap());
-            return Ok(res);
-        } else if req.method() == Method::GET && req.uri() == "/images/empty-cell.jpg" {
-            let mut res = Response::new(Body::from(&resources.empty_cell[..]));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-            return Ok(res);
-        } else if req.method() == Method::GET && req.uri() == "/images/x-cell.jpg" {
-            let mut res = Response::new(Body::from(&resources.x_cell[..]));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-            return Ok(res);
-        } else if req.method() == Method::GET && req.uri() == "/images/o-cell.jpg" {
-            let mut res = Response::new(Body::from(&resources.o_cell[..]));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-            return Ok(res);
-        } else if req.method() == Method::GET && req.uri() == "/grid.css" {
-            let mut res = Response::new(Body::from(&resources.css[..]));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().append(CONTENT_TYPE, "text/css".parse().unwrap());
-            return Ok(res);
-        } else if req.method() == Method::GET && req.uri() == "/images/favicon.png" {
-            let mut res = Response::new(Body::from(&resources.favicon[..]));
-            *res.status_mut() = StatusCode::OK;
-            res.headers_mut().append(CONTENT_TYPE, "image/png".parse().unwrap());
-            return Ok(res);
-        } else {
-            return Ok(Response::new(Body::from(&resources.homepage[..])));
-        };
-    }
+}
 
-    println!("Received a new ws handshake");
-    let ver = req.version();
-    tokio::task::spawn(async move {
-        match hyper::upgrade::on(&mut req).await {
-            Ok(upgraded) => {
-                let upgraded = TokioIo::new(upgraded);
-                handle_connection(
-                    WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await,
-                    addr,
-                    peer_list,
-                    game_message_factory
-                )
-                    .await;
-            }
-            Err(e) => println!("upgrade error: {}", e),
-        }
-    });
-    let mut res = Response::new(Body::default());
-    *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    *res.version_mut() = ver;
-    res.headers_mut().append(CONNECTION, upgrade);
-    res.headers_mut().append(UPGRADE, websocket);
-    res.headers_mut().append(SEC_WEBSOCKET_ACCEPT, derived.unwrap().parse().unwrap());
-    Ok(res)
+fn handle_http_request(req: &Request<Incoming>, resources: &'static StaticResource) -> Result<Response<Body>, Infallible> {
+    if req.method() == Method::GET && req.uri() == "/app.js" {
+        let mut res = Response::new(Body::from(&resources.javascript[..]));
+        *res.status_mut() = StatusCode::OK;
+        res.headers_mut().append(CONTENT_TYPE, "application/javascript".parse().unwrap());
+        Ok(res)
+    } else if req.method() == Method::GET && req.uri() == "/images/empty-cell.jpg" {
+        let mut res = Response::new(Body::from(&resources.empty_cell[..]));
+        *res.status_mut() = StatusCode::OK;
+        res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+        Ok(res)
+    } else if req.method() == Method::GET && req.uri() == "/images/x-cell.jpg" {
+        let mut res = Response::new(Body::from(&resources.x_cell[..]));
+        *res.status_mut() = StatusCode::OK;
+        res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+        Ok(res)
+    } else if req.method() == Method::GET && req.uri() == "/images/o-cell.jpg" {
+        let mut res = Response::new(Body::from(&resources.o_cell[..]));
+        *res.status_mut() = StatusCode::OK;
+        res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+        Ok(res)
+    } else if req.method() == Method::GET && req.uri() == "/grid.css" {
+        let mut res = Response::new(Body::from(&resources.css[..]));
+        *res.status_mut() = StatusCode::OK;
+        res.headers_mut().append(CONTENT_TYPE, "text/css".parse().unwrap());
+        Ok(res)
+    } else if req.method() == Method::GET && req.uri() == "/images/favicon.png" {
+        let mut res = Response::new(Body::from(&resources.favicon[..]));
+        *res.status_mut() = StatusCode::OK;
+        res.headers_mut().append(CONTENT_TYPE, "image/png".parse().unwrap());
+        Ok(res)
+    } else {
+        Ok(Response::new(Body::from(&resources.homepage[..])))
+    }
 }
