@@ -60,7 +60,7 @@ async fn main() -> Result<(), IoError> {
 
     let game_message_factory = Arc::new(GameMessageFactory::new());
 
-    // Let's spawn the handling of each connection in a separate task.
+    // Handling each connection in a separate task.
     while let Ok((stream, addr)) = listener.accept().await {
 
         let game_sessions = game_sessions.clone();
