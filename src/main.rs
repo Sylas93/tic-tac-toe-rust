@@ -41,77 +41,6 @@ use crate::resources::StaticResource;
 type PeerList = Arc<Mutex<Vec<Arc<Mutex<GameSession>>>>>;
 type Body = http_body_util::Full<hyper::body::Bytes>;
 
-async fn handle_websocket(
-    ws_stream: WebSocketStream<TokioIo<Upgraded>>,
-    addr: SocketAddr,
-    peer_list: PeerList,
-    game_message_factory: Arc<GameMessageFactory>
-) {
-    println!("WebSocket connection established: {}", addr);
-    let active = Arc::new(Mutex::new(true));
-
-    let (outgoing, incoming) = ws_stream.split();
-    let (tx, rx) = unbounded();
-    let tx = Arc::new(tx);
-    let mut is_player_a = true;
-    let gs = {
-        let mut sessions = peer_list.lock().unwrap();
-        match sessions.iter()
-        .find(|s| {s.lock().unwrap().phase == GameSessionPhase::LOBBY}) {
-            Some(&ref el) => {
-                println!("Existing session found");
-                let mut session = el.lock().unwrap();
-                session.sender_b = Some(Arc::clone(&tx));
-                session.start_game(&game_message_factory);
-                is_player_a = false;
-                Arc::clone(&el)
-            },
-            None => {
-                println!("New session required");
-                let out = Arc::new(Mutex::new(GameSession::new(Arc::clone(&tx))));
-                sessions.push(Arc::clone(&out));
-                message_send(&tx, game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE));
-                out
-            }
-        }
-    };
-    let player = if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
-
-    let combined_input_output = {
-        let input_processing = incoming
-            .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
-            .try_for_each(|input| {
-               let mut game_session = gs.lock().unwrap();
-                game_session.process_player_input(player, input, &game_message_factory);
-                future::ok(())
-            });
-
-        let output_stream = rx
-            .map(|msg| {
-                if game_message_factory.parse_input(&msg).1 == MessageType::END {
-                    *active.lock().unwrap() = false;
-                }
-                msg
-            })
-            .take_until(future::poll_fn(|_| {
-                if *active.lock().unwrap() {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(())
-                }
-            }))
-            .map(Ok).forward(outgoing);
-        future::select(output_stream, input_processing)
-    };
-
-    combined_input_output.await;
-
-    println!("{} disconnected", &addr);
-
-    let mut gs = gs.lock().unwrap();
-    gs.close_session(player, &game_message_factory);
-}
-
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
     let (js_socket_endpoint, listening_addr) = addresses();
@@ -261,6 +190,77 @@ fn is_not_socket_request(req: &Request<Incoming>, upgrade: &HeaderValue, headers
         || !headers.get(SEC_WEBSOCKET_VERSION).map(|h| h == "13").unwrap_or(false)
         || key.is_none()
         || req.uri() != "/socket"
+}
+
+async fn handle_websocket(
+    ws_stream: WebSocketStream<TokioIo<Upgraded>>,
+    addr: SocketAddr,
+    peer_list: PeerList,
+    game_message_factory: Arc<GameMessageFactory>
+) {
+    println!("WebSocket connection established: {}", addr);
+    let active = Arc::new(Mutex::new(true));
+
+    let (outgoing, incoming) = ws_stream.split();
+    let (tx, rx) = unbounded();
+    let tx = Arc::new(tx);
+    let mut is_player_a = true;
+    let gs = {
+        let mut sessions = peer_list.lock().unwrap();
+        match sessions.iter()
+            .find(|s| {s.lock().unwrap().phase == GameSessionPhase::LOBBY}) {
+            Some(&ref el) => {
+                println!("Existing session found");
+                let mut session = el.lock().unwrap();
+                session.sender_b = Some(Arc::clone(&tx));
+                session.start_game(&game_message_factory);
+                is_player_a = false;
+                Arc::clone(&el)
+            },
+            None => {
+                println!("New session required");
+                let out = Arc::new(Mutex::new(GameSession::new(Arc::clone(&tx))));
+                sessions.push(Arc::clone(&out));
+                message_send(&tx, game_message_factory.get_default(GameMessageFactory::WAITING_MESSAGE));
+                out
+            }
+        }
+    };
+    let player = if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
+
+    let combined_input_output = {
+        let input_processing = incoming
+            .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
+            .try_for_each(|input| {
+                let mut game_session = gs.lock().unwrap();
+                game_session.process_player_input(player, input, &game_message_factory);
+                future::ok(())
+            });
+
+        let output_stream = rx
+            .map(|msg| {
+                if game_message_factory.parse_input(&msg).1 == MessageType::END {
+                    *active.lock().unwrap() = false;
+                }
+                msg
+            })
+            .take_until(future::poll_fn(|_| {
+                if *active.lock().unwrap() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }))
+            .map(Ok).forward(outgoing);
+        future::select(output_stream, input_processing)
+    };
+
+    combined_input_output.await;
+
+    println!("{} disconnected", &addr);
+
+    let mut gs = gs.lock().unwrap();
+    gs.close_session(player, &game_message_factory);
 }
 
 fn handle_http_request(req: &Request<Incoming>, resources: &'static StaticResource) -> Result<Response<Body>, Infallible> {
