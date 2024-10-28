@@ -5,10 +5,14 @@ mod resources;
 
 use hyper_util::rt::TokioIo;
 
-use session::{GameSession, GameSessionPhase};
 use board::CellOwner;
 use message::{GameMessageFactory, MessageType};
+use session::{GameSession, GameSessionPhase};
 
+use futures_channel::mpsc::unbounded;
+use futures_util::{future, stream::TryStreamExt, StreamExt};
+use std::convert::Infallible;
+use std::task::Poll;
 use std::{
     env,
     io::Error as IoError,
@@ -16,16 +20,12 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use std::convert::Infallible;
-use std::task::Poll;
-use futures_channel::mpsc::unbounded;
-use futures_util::{future, stream::TryStreamExt, StreamExt};
 
+use hyper::header::CONTENT_TYPE;
 use hyper::{body::Incoming, header::{
     HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
     UPGRADE,
 }, server::conn::http1, service::service_fn, upgrade::Upgraded, HeaderMap, Method, Request, Response, StatusCode, Version};
-use hyper::header::CONTENT_TYPE;
 use tokio_tungstenite::{
     tungstenite::{
         handshake::derive_accept_key,
@@ -34,9 +34,9 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use tokio::net::TcpListener;
 use crate::message::message_send;
 use crate::resources::StaticResource;
+use tokio::net::TcpListener;
 
 type PeerList = Arc<Mutex<Vec<Arc<Mutex<GameSession>>>>>;
 type Body = http_body_util::Full<hyper::body::Bytes>;
@@ -62,7 +62,6 @@ async fn main() -> Result<(), IoError> {
 
     // Handling each connection in a separate task.
     while let Ok((stream, addr)) = listener.accept().await {
-
         let game_sessions = game_sessions.clone();
         let game_message_factory = Arc::clone(&game_message_factory); // other way of cloning
 
@@ -127,9 +126,8 @@ async fn handle_request(
     addr: SocketAddr,
     peer_list: PeerList,
     game_message_factory: Arc<GameMessageFactory>,
-    resources: &'static StaticResource
+    resources: &'static StaticResource,
 ) -> Result<Response<Body>, Infallible> {
-
     let upgrade = HeaderValue::from_static("Upgrade");
     let websocket = HeaderValue::from_static("websocket");
     let headers = req.headers();
@@ -150,7 +148,7 @@ async fn handle_request(
                         WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await,
                         addr,
                         peer_list,
-                        game_message_factory
+                        game_message_factory,
                     )
                         .await;
                 }
@@ -196,7 +194,7 @@ async fn handle_websocket(
     ws_stream: WebSocketStream<TokioIo<Upgraded>>,
     addr: SocketAddr,
     peer_list: PeerList,
-    game_message_factory: Arc<GameMessageFactory>
+    game_message_factory: Arc<GameMessageFactory>,
 ) {
     println!("WebSocket connection established: {}", addr);
     let active = Arc::new(Mutex::new(true));
@@ -208,7 +206,7 @@ async fn handle_websocket(
     let gs = {
         let mut sessions = peer_list.lock().unwrap();
         match sessions.iter()
-            .find(|s| {s.lock().unwrap().phase == GameSessionPhase::LOBBY}) {
+            .find(|s| { s.lock().unwrap().phase == GameSessionPhase::LOBBY }) {
             Some(&ref el) => {
                 println!("Existing session found");
                 let mut session = el.lock().unwrap();
@@ -216,7 +214,7 @@ async fn handle_websocket(
                 session.start_game(&game_message_factory);
                 is_player_a = false;
                 Arc::clone(&el)
-            },
+            }
             None => {
                 println!("New session required");
                 let out = Arc::new(Mutex::new(GameSession::new(Arc::clone(&tx))));
@@ -226,11 +224,11 @@ async fn handle_websocket(
             }
         }
     };
-    let player = if is_player_a {CellOwner::PLAYER_A} else {CellOwner::PLAYER_B};
+    let player = if is_player_a { CellOwner::PLAYER_A } else { CellOwner::PLAYER_B };
 
     let combined_input_output = {
         let input_processing = incoming
-            .map_ok(|msg|{ game_message_factory.parse_input(&msg)})
+            .map_ok(|msg| { game_message_factory.parse_input(&msg) })
             .try_for_each(|input| {
                 let mut game_session = gs.lock().unwrap();
                 game_session.process_player_input(player, input, &game_message_factory);

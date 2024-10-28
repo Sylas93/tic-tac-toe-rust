@@ -7,7 +7,7 @@ impl CellOwner {
     pub const PLAYER_B: &'static str = "PLAYER_B";
     pub const TIE: &'static str = "TIE";
 
-    pub fn opponent(player: &str) -> &str  {
+    pub fn opponent(player: &str) -> &str {
         match player {
             CellOwner::PLAYER_A => CellOwner::PLAYER_B,
             CellOwner::PLAYER_B => CellOwner::PLAYER_A,
@@ -22,16 +22,16 @@ pub struct GameBoard {
 
 impl GameBoard {
     pub fn new() -> GameBoard {
-        GameBoard{cells: [CellOwner::NONE; 9]}
+        GameBoard { cells: [CellOwner::NONE; 9] }
     }
 
     pub fn check_winner(&self) -> &str {
         self.check_board_health();
         let checks: [&str; 4] = [
-          self.line_check(|i| i/3), //rows
-          self.line_check(|i| i % 3), //columns
-          self.diagonal_check(|i| i % 4 == 0),
-          self.diagonal_check(|i| i != 0 && i != 8  && i % 2 == 0)
+            self.line_check(|i| i / 3), //rows
+            self.line_check(|i| i % 3), //columns
+            self.diagonal_check(|i| i % 4 == 0),
+            self.diagonal_check(|i| i != 0 && i != 8 && i % 2 == 0)
         ];
         let winner = checks.iter()
             .find(|&&x| x == CellOwner::PLAYER_A || x == CellOwner::PLAYER_B);
@@ -53,8 +53,8 @@ impl GameBoard {
     }
 
     fn check_board_health(&self) {
-        let mut a_count : i32 = 0;
-        let mut b_count : i32 = 0;
+        let mut a_count: i32 = 0;
+        let mut b_count: i32 = 0;
         for cell in self.cells {
             if cell == CellOwner::PLAYER_A {
                 a_count += 1;
@@ -67,9 +67,9 @@ impl GameBoard {
         }
     }
 
-    fn diagonal_check<F : Fn(usize) -> bool>(&self, filter: F) -> &str {
-        let mut a_count : i32 = 0;
-        let mut b_count : i32 = 0;
+    fn diagonal_check<F: Fn(usize) -> bool>(&self, filter: F) -> &str {
+        let mut a_count: i32 = 0;
+        let mut b_count: i32 = 0;
         for (index, el) in self.cells.iter().enumerate() {
             let owner = *el;
             if filter(index) {

@@ -1,14 +1,14 @@
-use std::sync::Arc;
-use futures_channel::mpsc::UnboundedSender;
-use tokio_tungstenite::tungstenite::Message;
 use crate::board::{CellOwner, GameBoard};
 use crate::message::{message_send, multi_message_send, GameMessageFactory, MessageType};
+use futures_channel::mpsc::UnboundedSender;
+use std::sync::Arc;
+use tokio_tungstenite::tungstenite::Message;
 
 #[derive(PartialEq)]
 pub enum GameSessionPhase {
     LOBBY,
     PLAYING,
-    CLOSED
+    CLOSED,
 }
 
 pub struct GameSession {
@@ -16,14 +16,17 @@ pub struct GameSession {
     pub(crate) phase: GameSessionPhase,
     pub(crate) turn: &'static str,
     sender_a: Arc<UnboundedSender<Message>>,
-    pub(crate) sender_b: Option<Arc<UnboundedSender<Message>>>
+    pub(crate) sender_b: Option<Arc<UnboundedSender<Message>>>,
 }
 
 impl GameSession {
     pub fn new(sender_a: Arc<UnboundedSender<Message>>) -> GameSession {
         GameSession {
             board: GameBoard::new(),
-            phase: GameSessionPhase::LOBBY, turn: CellOwner::PLAYER_A, sender_a, sender_b: None
+            phase: GameSessionPhase::LOBBY,
+            turn: CellOwner::PLAYER_A,
+            sender_a,
+            sender_b: None,
         }
     }
 
@@ -34,8 +37,8 @@ impl GameSession {
         match &self.sender_b {
             Some(sender) => {
                 message_send(sender, game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE));
-            },
-            None => {println!("Error starting game B")}
+            }
+            None => { println!("Error starting game B") }
         }
     }
 
@@ -43,7 +46,7 @@ impl GameSession {
         &mut self,
         player: &'static str,
         (input_text, input_type): (String, String),
-        game_message_factory: &GameMessageFactory
+        game_message_factory: &GameMessageFactory,
     ) {
         if self.update_board(player, &input_text, &input_type) {
             println!("Board updated!");
@@ -59,24 +62,24 @@ impl GameSession {
                 multi_message_send(
                     &self.opponent_sink(player),
                     &[figure_message, show_message,
-                        game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE)]
+                        game_message_factory.get_default(GameMessageFactory::YOUR_TURN_MESSAGE)],
                 );
                 multi_message_send(
                     &self.opponent_sink(CellOwner::opponent(player)),
                     &[figure_message, show_message,
-                        game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE)]
+                        game_message_factory.get_default(GameMessageFactory::OPPONENT_TURN_MESSAGE)],
                 );
             } else if winner == player {
                 self.phase = GameSessionPhase::CLOSED;
                 multi_message_send(
                     &self.opponent_sink(player),
                     &[figure_message, show_message,
-                        game_message_factory.get_default(GameMessageFactory::LOST_MESSAGE)]
+                        game_message_factory.get_default(GameMessageFactory::LOST_MESSAGE)],
                 );
                 multi_message_send(
                     &self.opponent_sink(CellOwner::opponent(player)),
                     &[figure_message, show_message,
-                        game_message_factory.get_default(GameMessageFactory::WIN_MESSAGE)]
+                        game_message_factory.get_default(GameMessageFactory::WIN_MESSAGE)],
                 );
             } else if winner == CellOwner::TIE {
                 self.phase = GameSessionPhase::CLOSED;
