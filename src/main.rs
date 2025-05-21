@@ -224,7 +224,7 @@ async fn handle_websocket(
             }
         }
     };
-    let player = if is_player_a { CellOwner::PLAYER_A } else { CellOwner::PLAYER_B };
+    let player = if is_player_a { CellOwner::PlayerA } else { CellOwner::PlayerB };
 
     let combined_input_output = {
         let input_processing = incoming
