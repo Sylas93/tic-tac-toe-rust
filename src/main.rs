@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-
+use std::sync::atomic::{AtomicBool, Ordering};
 use hyper::header::CONTENT_TYPE;
 use hyper::{body::Incoming, header::{
     HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
@@ -197,7 +197,7 @@ async fn handle_websocket(
     game_message_factory: Arc<GameMessageFactory>,
 ) {
     println!("WebSocket connection established: {}", addr);
-    let active = Arc::new(Mutex::new(true));
+    let active = AtomicBool::new(true);
 
     let (outgoing, incoming) = ws_stream.split();
     let (tx, rx) = unbounded();
@@ -238,12 +238,12 @@ async fn handle_websocket(
         let output_stream = rx
             .map(|msg| {
                 if game_message_factory.parse_input(&msg).1 == MessageType::END {
-                    *active.lock().unwrap() = false;
+                    active.store(false, Ordering::Relaxed);
                 }
                 msg
             })
             .take_until(future::poll_fn(|_| {
-                if *active.lock().unwrap() {
+                if active.load(Ordering::Relaxed) {
                     Poll::Pending
                 } else {
                     Poll::Ready(())
