@@ -76,8 +76,14 @@ impl GameMessageFactory {
     }
 
     pub fn build_plain_message(m: &str, t: &str) -> String {
-        let template = "{ \"text\": \"$\", \"type\": \"$\" }";
-        let message = String::from(template).replacen("$", m, 1).replacen("$", t, 1);
+        let message =
+            serde_json::json!(
+                {
+                    "text": m,
+                    "type": t
+                }
+            ).to_string();
+
         println!("The resulting message is: {message}");
         message
     }
