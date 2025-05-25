@@ -14,13 +14,13 @@ async fn read_js_with_endpoint(ws_endpoint: &str) -> Vec<u8> {
 }
 
 pub struct StaticResource {
-    pub(crate) homepage: Vec<u8>,
-    pub(crate) javascript: Vec<u8>,
-    pub(crate) empty_cell: Vec<u8>,
-    pub(crate) x_cell: Vec<u8>,
-    pub(crate) o_cell: Vec<u8>,
-    pub(crate) css: Vec<u8>,
-    pub(crate) favicon: Vec<u8>,
+    pub homepage: Vec<u8>,
+    pub javascript: Vec<u8>,
+    pub empty_cell: Vec<u8>,
+    pub x_cell: Vec<u8>,
+    pub o_cell: Vec<u8>,
+    pub css: Vec<u8>,
+    pub favicon: Vec<u8>,
 }
 
 impl StaticResource {

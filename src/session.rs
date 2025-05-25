@@ -12,11 +12,11 @@ pub enum GameSessionPhase {
 }
 
 pub struct GameSession {
-    pub(crate) board: GameBoard,
-    pub(crate) phase: GameSessionPhase,
-    pub(crate) turn: CellOwner,
+    pub board: GameBoard,
+    pub phase: GameSessionPhase,
+    pub turn: CellOwner,
     sender_a: Arc<UnboundedSender<Message>>,
-    pub(crate) sender_b: Option<Arc<UnboundedSender<Message>>>,
+    pub sender_b: Option<Arc<UnboundedSender<Message>>>,
 }
 
 impl GameSession {
