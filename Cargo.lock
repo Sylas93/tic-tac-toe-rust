@@ -563,7 +563,6 @@ dependencies = [
 name = "tic-tac-toe"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures-channel",
  "futures-util",
  "http-body-util",
@@ -572,7 +571,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
- "tokio-util",
  "tungstenite",
 ]
 
