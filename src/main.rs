@@ -262,37 +262,43 @@ async fn handle_websocket(
 }
 
 fn handle_http_request(req: &Request<Incoming>, resources: &'static StaticResource) -> Result<Response<Body>, Infallible> {
-    if req.method() == Method::GET && req.uri() == "/app.js" {
-        let mut res = Response::new(Body::from(&resources.javascript[..]));
-        *res.status_mut() = StatusCode::OK;
-        res.headers_mut().append(CONTENT_TYPE, "application/javascript".parse().unwrap());
-        Ok(res)
-    } else if req.method() == Method::GET && req.uri() == "/images/empty-cell.jpg" {
-        let mut res = Response::new(Body::from(&resources.empty_cell[..]));
-        *res.status_mut() = StatusCode::OK;
-        res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-        Ok(res)
-    } else if req.method() == Method::GET && req.uri() == "/images/x-cell.jpg" {
-        let mut res = Response::new(Body::from(&resources.x_cell[..]));
-        *res.status_mut() = StatusCode::OK;
-        res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-        Ok(res)
-    } else if req.method() == Method::GET && req.uri() == "/images/o-cell.jpg" {
-        let mut res = Response::new(Body::from(&resources.o_cell[..]));
-        *res.status_mut() = StatusCode::OK;
-        res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
-        Ok(res)
-    } else if req.method() == Method::GET && req.uri() == "/grid.css" {
-        let mut res = Response::new(Body::from(&resources.css[..]));
-        *res.status_mut() = StatusCode::OK;
-        res.headers_mut().append(CONTENT_TYPE, "text/css".parse().unwrap());
-        Ok(res)
-    } else if req.method() == Method::GET && req.uri() == "/images/favicon.png" {
-        let mut res = Response::new(Body::from(&resources.favicon[..]));
-        *res.status_mut() = StatusCode::OK;
-        res.headers_mut().append(CONTENT_TYPE, "image/png".parse().unwrap());
-        Ok(res)
-    } else {
-        Ok(Response::new(Body::from(&resources.homepage[..])))
+    match req.uri().path() {
+        "/app.js" => {
+            let mut res = Response::new(Body::from(&resources.javascript[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "application/javascript".parse().unwrap());
+            Ok(res)
+        },
+        "/images/empty-cell.jpg" => {
+            let mut res = Response::new(Body::from(&resources.empty_cell[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            Ok(res)
+        },
+        "/images/x-cell.jpg" => {
+            let mut res = Response::new(Body::from(&resources.x_cell[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            Ok(res)
+        },
+        "/images/o-cell.jpg" => {
+            let mut res = Response::new(Body::from(&resources.o_cell[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            Ok(res)
+        },
+        "/grid.css" => {
+            let mut res = Response::new(Body::from(&resources.css[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "text/css".parse().unwrap());
+            Ok(res)
+        },
+        "/images/favicon.png" => {
+            let mut res = Response::new(Body::from(&resources.favicon[..]));
+            *res.status_mut() = StatusCode::OK;
+            res.headers_mut().append(CONTENT_TYPE, "image/png".parse().unwrap());
+            Ok(res)
+        },
+        _ => Ok(Response::new(Body::from(&resources.homepage[..])))
     }
 }
