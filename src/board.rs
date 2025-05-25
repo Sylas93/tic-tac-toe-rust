@@ -1,4 +1,3 @@
-//#[derive(Clone, Copy)]
 #[derive(PartialEq, Clone, Copy)]
 pub enum CellOwner {
     None,
